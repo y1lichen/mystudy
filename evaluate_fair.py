@@ -1,3 +1,4 @@
+"""evaluate_fair.py — v8.4"""
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,157 +7,139 @@ from torch.utils.data import DataLoader
 from lbnl_chiller_dataset import LBNLChillerDataset
 from decision_pinn import DecisionPINN
 
-# 安全計算開機時段 MAPE 的函數，避免被停機狀態 (0 kW) 的除以零無限大拉爆
+
 def safe_mape(y_true, y_pred, threshold=5.0):
     mask = y_true > threshold
     if np.sum(mask) == 0:
         return 0.0
     return mean_absolute_percentage_error(y_true[mask], y_pred[mask])
 
+
 def evaluate_model():
-    # 自動偵測設備
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🔍 評估模式啟動！使用的運算設備: {device}")
-
-    dataset = LBNLChillerDataset("data/ChillerPlant_test.csv") 
+    dataset    = LBNLChillerDataset("data/ChillerPlant_test.csv")
     dataloader = DataLoader(dataset, batch_size=1024, shuffle=False)
-    
-    # 模型放上 GPU，並傳入正確的 V_max
     model = DecisionPINN(V_max=dataset.v_max).to(device)
-    model.load_state_dict(torch.load("decision_pinn.pth", map_location=device, weights_only=True))
+    model.load_state_dict(torch.load("decision_pinn.pth", map_location=device,
+                                     weights_only=True))
     model.eval()
-    
-    # 追蹤總耗電與子設備耗電
-    all_hist_power, all_pred_hist_power = [], []
-    all_hist_chiller, all_pred_chiller = [], []
-    all_hist_tower, all_pred_tower = [], []
-    all_hist_pump, all_pred_pump = [], []
-    
-    # 追蹤動態物理參數
-    all_delta_s, all_ua_tower = [], []
-    
-    # 追蹤 AI 最佳化結果
+
+    all_hist_power, all_pred_hist_power   = [], []
+    all_hist_chiller, all_pred_chiller    = [], []
+    all_hist_tower, all_pred_tower        = [], []
+    all_hist_pump, all_pred_pump          = [], []
+    all_hist_pump_fixed, all_pred_pump_fixed = [], []
+    all_hist_pump_vfd, all_pred_pump_vfd  = [], []
+    all_delta_s, all_ua_tower             = [], []
     all_opt_power, all_q_load, all_q_pred = [], [], []
-    all_t_cdw, all_t_wet = [], []
-    comp_power, tower_power, pump_power = [], [], []
+    all_t_cdw, all_t_wet                  = [], []
+    comp_power, tower_power, pump_power   = [], [], []
 
     with torch.no_grad():
-        for state, hist_action, hist_total_power, hist_q_rejection, hist_chiller_power, hist_tower_power, hist_pump_power in dataloader:
-            state = state.to(device)
+        for batch in dataloader:
+            (state, hist_action, hist_total_power, hist_q_rejection,
+             hist_chiller_power, hist_tower_power, hist_pump_power,
+             hist_pump_fixed, hist_pump_vfd) = batch
+            state       = state.to(device)
             hist_action = hist_action.to(device)
-            
-            # 取得歷史設定點下的模型預測 (用於 System ID 驗證與節能基準)
-            hist_phys = model.physics_forward(state, hist_action)
-            
-            # 取得 AI 策略網路給出的最佳化設定點
+
+            # 兩者都用 detach_pump=True（預設），保持 training/evaluate 一致
+            hist_phys  = model.physics_forward(state, hist_action)
             opt_action = model(state)
-            
-            # 取得最佳化設定點下的模型預測 (用於計算節能效果)
-            opt_phys = model.physics_forward(state, opt_action)
-            
-            # --- 收集真實與預測耗電 (System ID) ---
+            opt_phys   = model.physics_forward(state, opt_action)
+
+            # 泵拆解：v8.4 用 (V_norm, num_sec_pumps)，無 ct_fan_avg
+            T_dry         = state[:, 0:1]
+            Q_load        = state[:, 2:3]
+            V_sec         = state[:, 4:5]
+            chl_sta       = state[:, 6:9]
+            V_norm        = V_sec / dataset.v_max
+            num_running   = chl_sta.sum(dim=1, keepdim=True)
+            num_sec_pumps = torch.clamp(num_running, max=2.0)
+            pred_fixed    = model.pump_spinn.fixed_pump(num_running, Q_load, T_dry)
+            pred_vfd      = model.pump_spinn.vfd_pump(V_norm, num_sec_pumps)
+
             all_hist_power.extend(hist_total_power.cpu().numpy())
             all_pred_hist_power.extend(hist_phys["total_power"].cpu().numpy())
-            
             all_hist_chiller.extend(hist_chiller_power.cpu().numpy())
             all_pred_chiller.extend(hist_phys["thermo_chiller_power"].cpu().numpy())
-            
             all_hist_tower.extend(hist_tower_power.cpu().numpy())
             all_pred_tower.extend(hist_phys["tower_power"].cpu().numpy())
-            
             all_hist_pump.extend(hist_pump_power.cpu().numpy())
             all_pred_pump.extend(hist_phys["pump_power"].cpu().numpy())
-            
-            # 收集動態物理參數
+            all_hist_pump_fixed.extend(hist_pump_fixed.cpu().numpy())
+            all_pred_pump_fixed.extend(pred_fixed.cpu().numpy())
+            all_hist_pump_vfd.extend(hist_pump_vfd.cpu().numpy())
+            all_pred_pump_vfd.extend(pred_vfd.cpu().numpy())
             all_delta_s.extend(hist_phys["delta_S"].cpu().numpy())
             all_ua_tower.extend(hist_phys["UA_tower"].cpu().numpy())
-            
-            # --- 收集 AI 最佳化狀態 ---
             all_opt_power.extend(opt_phys["total_power"].cpu().numpy())
             all_q_load.extend(state[:, 2:3].cpu().numpy())
             all_q_pred.extend(opt_phys["Q_pred"].cpu().numpy())
             all_t_cdw.extend(opt_phys["T_cdw_set"].cpu().numpy())
             all_t_wet.extend(opt_phys["T_wet"].cpu().numpy())
-            
             comp_power.extend(opt_phys["thermo_chiller_power"].cpu().numpy())
             tower_power.extend(opt_phys["tower_power"].cpu().numpy())
             pump_power.extend(opt_phys["pump_power"].cpu().numpy())
 
-    # 轉換為 numpy array
-    all_hist_power = np.array(all_hist_power).flatten()
-    all_pred_hist_power = np.array(all_pred_hist_power).flatten()
-    all_hist_chiller = np.array(all_hist_chiller).flatten()
-    all_pred_chiller = np.array(all_pred_chiller).flatten()
-    all_hist_tower = np.array(all_hist_tower).flatten()
-    all_pred_tower = np.array(all_pred_tower).flatten()
-    all_hist_pump = np.array(all_hist_pump).flatten()
-    all_pred_pump = np.array(all_pred_pump).flatten()
-    all_opt_power = np.array(all_opt_power).flatten()
+    def _np(lst): return np.array(lst).flatten()
+    all_hist_power      = _np(all_hist_power)
+    all_pred_hist_power = _np(all_pred_hist_power)
+    all_hist_chiller    = _np(all_hist_chiller)
+    all_pred_chiller    = _np(all_pred_chiller)
+    all_hist_tower      = _np(all_hist_tower)
+    all_pred_tower      = _np(all_pred_tower)
+    all_hist_pump       = _np(all_hist_pump)
+    all_pred_pump       = _np(all_pred_pump)
+    all_hist_pump_fixed = _np(all_hist_pump_fixed)
+    all_pred_pump_fixed = _np(all_pred_pump_fixed)
+    all_hist_pump_vfd   = _np(all_hist_pump_vfd)
+    all_pred_pump_vfd   = _np(all_pred_pump_vfd)
+    all_opt_power       = _np(all_opt_power)
 
-    # ==========================================
-    # 🥇 Metric 1: System ID Sanity Check (模組化分析)
-    # ==========================================
-    # 用於驗證模型是否能準確代表物理現實
     print("\n🥇 [Metric 1] System ID Sanity Check (Modular)")
-    
-    r2_total = r2_score(all_hist_power, all_pred_hist_power)
-    print(f"  [全系統] R-squared: {r2_total:.4f} | 開機 MAPE: {safe_mape(all_hist_power, all_pred_hist_power)*100:.2f}%")
-    
-    r2_chiller = r2_score(all_hist_chiller, all_pred_chiller)
-    print(f"  [主  機] R-squared: {r2_chiller:.4f} | 開機 MAPE: {safe_mape(all_hist_chiller, all_pred_chiller)*100:.2f}%")
-    
-    r2_tower = r2_score(all_hist_tower, all_pred_tower)
-    print(f"  [水  塔] R-squared: {r2_tower:.4f} | 開機 MAPE: {safe_mape(all_hist_tower, all_pred_tower)*100:.2f}%")
-    
-    r2_pump = r2_score(all_hist_pump, all_pred_pump)
-    print(f"  [水  泵] R-squared: {r2_pump:.4f} | 開機 MAPE: {safe_mape(all_hist_pump, all_pred_pump)*100:.2f}%")
+    print(f"  [全系統] R²={r2_score(all_hist_power,all_pred_hist_power):.4f} | "
+          f"開機 MAPE={safe_mape(all_hist_power,all_pred_hist_power)*100:.2f}%")
+    print(f"  [主  機] R²={r2_score(all_hist_chiller,all_pred_chiller):.4f} | "
+          f"開機 MAPE={safe_mape(all_hist_chiller,all_pred_chiller)*100:.2f}%")
+    print(f"  [水  塔] R²={r2_score(all_hist_tower,all_pred_tower):.4f} | "
+          f"開機 MAPE={safe_mape(all_hist_tower,all_pred_tower)*100:.2f}%")
+    print(f"  [水泵合計] R²={r2_score(all_hist_pump,all_pred_pump):.4f} | "
+          f"開機 MAPE={safe_mape(all_hist_pump,all_pred_pump)*100:.2f}%")
+    print(f"    ├─ [定速泵] R²={r2_score(all_hist_pump_fixed,all_pred_pump_fixed):.4f} | "
+          f"開機 MAPE={safe_mape(all_hist_pump_fixed,all_pred_pump_fixed)*100:.2f}%")
+    print(f"    └─ [變速泵] R²={r2_score(all_hist_pump_vfd,all_pred_pump_vfd):.4f} | "
+          f"開機 MAPE={safe_mape(all_hist_pump_vfd,all_pred_pump_vfd)*100:.2f}%")
+    print(f"  - 動態物理參數: ΔS={np.mean(all_delta_s):.4f}, UA={np.mean(all_ua_tower):.2f}")
 
-    avg_delta_s = np.mean(all_delta_s)
-    avg_ua_tower = np.mean(all_ua_tower)
-    print(f"  - 動態物理參數平均值: 系統平均 ΔS={avg_delta_s:.4f}, 平均 UA={avg_ua_tower:.2f}")
-
-    # ==========================================
-    # 🥈 Metric 2: Energy Savings Performance (模型對齊版)
-    # ==========================================
-    # 修正：使用「模型預測歷史」與「模型預測優化」進行比較，消除系統性偏差
-    total_real_hist_kwh = np.sum(all_hist_power)
-    total_pred_hist_kwh = np.sum(all_pred_hist_power)
-    total_opt_kwh = np.sum(all_opt_power)
-    
-    # 公平的節能比例計算
-    fair_savings_pct = (total_pred_hist_kwh - total_opt_kwh) / total_pred_hist_kwh * 100
-    
+    total_real   = np.sum(all_hist_power)
+    total_pred   = np.sum(all_pred_hist_power)
+    total_opt    = np.sum(all_opt_power)
+    fair_savings = (total_pred - total_opt) / total_pred * 100
     print("\n🥈 [Metric 2] Energy Savings Performance")
-    print(f"  - 歷史真實耗電 (量測值): {total_real_hist_kwh:.0f} kW")
-    print(f"  - 模型歷史耗電 (基準值): {total_pred_hist_kwh:.0f} kW")
-    print(f"  - AI 最佳化耗電 (預測值): {total_opt_kwh:.0f} kW")
-    print(f"  - 修正後的節能比例: {fair_savings_pct:.2f}%")
+    print(f"  - 歷史真實耗電 (量測值): {total_real:.0f} kW")
+    print(f"  - 模型歷史耗電 (基準值): {total_pred:.0f} kW")
+    print(f"  - AI 最佳化耗電 (預測值): {total_opt:.0f} kW")
+    print(f"  - 修正後的節能比例: {fair_savings:.2f}%")
 
-    # 畫出堆疊圖
-    avg_comp = np.mean(comp_power)
+    avg_comp  = np.mean(comp_power)
     avg_tower = np.mean(tower_power)
-    avg_pump = np.mean(pump_power)
-    
+    avg_pump  = np.mean(pump_power)
     plt.figure(figsize=(8, 6))
-    plt.bar(['Optimized Policy'], [avg_comp], label='Chiller Compressor')
+    plt.bar(['Optimized Policy'], [avg_comp],  label='Chiller Compressor')
     plt.bar(['Optimized Policy'], [avg_tower], bottom=[avg_comp], label='Cooling Tower')
-    plt.bar(['Optimized Policy'], [avg_pump], bottom=[avg_comp + avg_tower], label='Water Pump')
-    plt.ylabel('Average Power (kW)')
-    plt.title('AI Optimal Resource Allocation')
-    plt.legend()
-    plt.savefig('energy_breakdown.png')
-    print("  -> 已儲存堆疊長條圖: energy_breakdown.png")
+    plt.bar(['Optimized Policy'], [avg_pump],  bottom=[avg_comp+avg_tower], label='Water Pump')
+    plt.ylabel('Average Power (kW)'); plt.title('AI Optimal Resource Allocation')
+    plt.legend(); plt.savefig('energy_breakdown.png')
+    print("  -> 已儲存: energy_breakdown.png")
 
-    # ==========================================
-    # 🥉 Metric 3: Constraint Satisfaction Rate
-    # ==========================================
-    # 驗證 AI 決策是否遵守物理約束與負荷需求
-    load_satisfied = np.sum(np.array(all_q_pred) >= np.array(all_q_load)) / len(all_q_load)
-    thermo_safe = np.sum(np.array(all_t_cdw) >= np.array(all_t_wet) + 1.9) / len(all_t_cdw)
-    
+    load_satisfied = np.sum(_np(all_q_pred) >= _np(all_q_load)) / len(all_q_load)
+    thermo_safe    = np.sum(_np(all_t_cdw) >= _np(all_t_wet) + 1.9) / len(all_t_cdw)
     print("\n🥉 [Metric 3] Constraint Satisfaction")
     print(f"  - 負載滿足率 (Q_pred >= Q_load): {load_satisfied*100:.2f}%")
     print(f"  - 熱力學安全率 (T_cdw > T_wet): {thermo_safe*100:.2f}%")
+
 
 if __name__ == "__main__":
     evaluate_model()
