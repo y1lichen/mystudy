@@ -1,42 +1,52 @@
-"""DecisionPINN — v8.4
+"""
+DecisionPINN — v8.5
 
-v8.3 根本問題修正：
+水泵模型全面升級：實作論文 Eq.(12) 的物理結構
+  P = λV³ / Sigmoid(NN(V, λV², num))
 
-【問題 1】VFD 使用 ct_fan_avg 作為代理輸入在邏輯上錯誤
-  次側泵（Secondary CHW Pump）的控制信號是 CWL_SEC_PM_SPD（次側泵速）
-  policy 的 action 完全不包含次側泵速，用 ct_fan 作代理造成梯度衝突
-  修正：VFD 只用 V_norm（流量）作為輸入，去掉 ct_fan_avg
-        V_norm 是 state，與 action 無關，VFD 功率對 policy 無梯度 → 直接 detach
+【三種泵的物理設計】
 
-【問題 2】training vs evaluate 定義不一致（detach_pump 訓練時固定，評估時活動）
-  training: total = chiller + pump.detach() + tower
-  evaluate: total = chiller + pump(ct_fan變化) + tower → pump 暴增
-  修正：VFD 輸入與 action 完全解耦後，detach_pump 在 evaluate 也是安全的
-        physics_forward 保留 detach_pump 參數，evaluate 也傳 True
+1. CDWPumpSPINN（冷凝水泵，CDW × 3，定速）
+   - V: CDWL_CW_FLOW（冷凝水流量，來自 state[9]）
+   - λ_cdw: 可學習參數 exp(log_lam_cdw)（無差壓量測）
+   - P = λV³ * UNIT_CONV / Sigmoid(NN(V_norm, λV_norm², num/3))
+   - 乘以 num_running（每台冷機帶動 1 台 CDW 泵）
 
-【問題 3】定速泵 R²=0.037（線性模型仍無法捕捉時間變異）
-  定速泵功率雖然「定速」但因效率、溫度等因素有時間變異
-  用更豐富的特徵：num_running + Q_load（負荷代理）+ T_dry（環境溫度代理）
-  改回 MLP，但不用 LayerNorm，改用 BatchNorm（批次內不同樣本可以歸一化）
-  這樣可以捕捉到時間變異，同時避免 LayerNorm 的梯度消失問題
+2. PRIPumpSPINN（主側冷水泵，Primary CHW × 3，定速）
+   - V: CWL_PRI_CW_FLOW（主側流量，來自 state[10]）
+   - λ_pri: 可學習參數 exp(log_lam_pri)
+   - 結構與 CDW 泵相同
 
-【定速泵模型選擇】
-  LayerNorm 在 Linear(1→32) 後梯度消失 → 之前的問題
-  BatchNorm(32) 對 batch 內不同樣本歸一化 → 批次內 num_running 有 0/1/2/3 多種值 → 正常
-  輸入：[num_running/3, Q_load/1000, T_dry/300]（3維，有時間變異信息）
-  輸出：Sigmoid * MAX_FIXED_KW（上界保護）
+3. SECPumpSPINN（次側變速泵，Secondary CHW × 2，VFD）
+   - V: CWL_SEC_CW_FLOW（次側流量，來自 state[4]）
+   - λ_sec: 從資料計算 λ = CWL_SEC_DP / V²（來自 state[11]）
+   - P = λV³ * UNIT_CONV / Sigmoid(NN(V_norm, λV_norm², num_sec/2))
+
+【單位換算】
+   UNIT_CONV = 6.309e-5 [m³/s/GPM] × 249.1 [Pa/inH2O] / 1000 [W/kW]
+             = 1.572e-5  kW / (GPM × inH2O)
+   P[kW] = λ[inH2O/GPM²] × V[GPM]³ × UNIT_CONV / η
+
+【歸一化空間的公式】
+   V_norm = V / V_max
+   H_norm = λ_norm × V_norm²  （= H / H_ref）
+   ideal  = λ_norm × V_norm³  （理想功率，歸一化）
+   P[kW]  = ideal × P_scale / Sigmoid(NN(V_norm, H_norm, num))
+   其中 P_scale = λ_ref × V_max³ × UNIT_CONV 吸收量綱，可學習
+
+   實作上令 P_scale = exp(log_scale)，與 log_lam 合併為一個可學習縮放
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-TOWER_MAX_KW     = 40.0
-SEC_PUMP_MAX_KW  = 80.0
-MAX_FIXED_KW     = 120.0   # 3台定速泵上界（3 × ~35 kW）
+TOWER_MAX_KW   = 40.0
+# 單位換算係數：GPM × inH2O → kW
+UNIT_CONV      = 6.309e-5 * 249.1 / 1000   # = 1.572e-5
 
-_TOWER_SCALE    = torch.tensor([500.0, 290.0, 290.0, 15.0, 2.0])
-_CHILLER_SCALE  = torch.tensor([300.0, 283.0, 295.0,  1.0, 1.0])
+_TOWER_SCALE   = torch.tensor([500.0, 290.0, 290.0, 15.0, 2.0])
+_CHILLER_SCALE = torch.tensor([300.0, 283.0, 295.0,  1.0, 1.0])
 
 
 class MLP(nn.Module):
@@ -54,78 +64,150 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class FixedSpeedPumpModel(nn.Module):
+class PumpPhysicsBlock(nn.Module):
     """
-    定速泵模型 v8.4：3維輸入 MLP + BatchNorm（避免 LayerNorm 梯度消失）
+    單一泵群的 S-PINN 物理結構（論文 Eq.12）：
 
-    輸入：[num_running/3, Q_load_norm, T_dry_norm]
-      num_running：主要驅動因素（台數）
-      Q_load_norm：負荷代理，捕捉泵在高負荷時效率變化
-      T_dry_norm ：環境溫度代理，捕捉冷凝側溫度對泵功率的影響
-    輸出：Sigmoid * MAX_FIXED_KW（上界 120 kW = 3台 × 40 kW）
+        P = exp(log_scale) × V_norm³ × lam_norm
+            / Sigmoid(NN(V_norm, lam_norm × V_norm², num_norm))
 
-    BatchNorm 在批次內對不同 num_running 的樣本做歸一化，
-    解決 LayerNorm 在同值輸入時 std=0 的梯度消失問題。
+    其中 exp(log_scale) 為可學習縮放，吸收 UNIT_CONV × V_max³ × λ_ref。
+    lam_norm：歸一化管路阻力係數
+      - 定速泵：exp(log_lam)（可學習，因無差壓量測）
+      - 變速泵：從資料即時計算 λ_sec = dp / V²（傳入 lam_input）
+
+    效率網路 NN 輸入：[V_norm, H_norm(=λV²), num_norm]
+    輸出 Sigmoid ∈ (0,1) 即為 η（效率）
+    Clamp 至 [0.2, 0.95] 限制物理範圍。
+    """
+    def __init__(self, learnable_lam=True, init_log_scale=2.0):
+        """
+        learnable_lam: True → λ 為可學習參數（CDW/Primary 泵）
+                       False → λ 從外部傳入（Secondary 泵）
+        init_log_scale: exp(init_log_scale) = 初始 P_scale ≈ 7.4 kW（調整至資料量級）
+        """
+        super().__init__()
+        self.learnable_lam = learnable_lam
+        if learnable_lam:
+            # 初始化 λ_norm=1（中性），訓練過程中自由調整
+            self.log_lam = nn.Parameter(torch.tensor(0.0))
+        # P_scale：吸收 UNIT_CONV × V_max³ × λ_ref，可學習
+        self.log_scale = nn.Parameter(torch.tensor(float(init_log_scale)))
+        # 效率網路：3維輸入（V_norm, H_norm, num_norm）
+        self.eff_net = nn.Sequential(
+            nn.Linear(3, 32), nn.ReLU(),
+            nn.Linear(32, 32), nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        # 初始化讓 sigmoid 輸出接近 0.5（η=0.5，中性初始）
+        nn.init.zeros_(self.eff_net[-1].weight)
+        nn.init.zeros_(self.eff_net[-1].bias)
+
+    def forward(self, V_norm, num_norm, lam_input=None, on_mask=None):
+        """
+        V_norm:    (B,1) 流量歸一化
+        num_norm:  (B,1) 台數歸一化（num / max_num）
+        lam_input: (B,1) 外部λ（learnable_lam=False 時使用），已歸一化
+        on_mask:   (B,1) bool，開機遮罩，關機強制輸出 0
+        """
+        if self.learnable_lam:
+            lam_norm = torch.exp(self.log_lam).expand(V_norm.shape)  # (B,1)
+        else:
+            lam_norm = lam_input.clamp(min=1e-4)   # 防止零除
+
+        P_scale = torch.exp(self.log_scale)
+        H_norm  = lam_norm * V_norm ** 2            # 壓頭（歸一化）
+        ideal   = lam_norm * V_norm ** 3            # 理想功率（歸一化）
+
+        eff_input = torch.cat([V_norm, H_norm, num_norm], dim=1)
+        eta = torch.sigmoid(self.eff_net(eff_input)).clamp(0.2, 0.95)
+
+        power = P_scale * ideal / eta               # kW
+
+        if on_mask is not None:
+            power = power * on_mask.float()
+
+        return power
+
+    def get_lam(self):
+        if self.learnable_lam:
+            return torch.exp(self.log_lam).item()
+        return None
+
+    def get_scale(self):
+        return torch.exp(self.log_scale).item()
+
+
+class CDWPumpSPINN(nn.Module):
+    """
+    冷凝水泵（CDW Pump × 3）S-PINN。
+    λ_cdw 可學習，V_cdw 來自 CDWL_CW_FLOW（state[9] × v_cdw_max）。
+    每台冷機帶動 1 台 CDW 泵，num = num_running。
     """
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(3, 64), nn.BatchNorm1d(64), nn.ReLU(),
-            nn.Linear(64, 32), nn.BatchNorm1d(32), nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-        nn.init.constant_(self.net[-1].bias, 0.0)
+        self.block = PumpPhysicsBlock(learnable_lam=True, init_log_scale=2.5)
 
-    def forward(self, num_running, Q_load=None, T_dry=None):
-        """
-        num_running: (B,1) float {0,1,2,3}
-        Q_load:      (B,1) kW（可選，None 時用零）
-        T_dry:       (B,1) K（可選，None 時用零）
-        """
-        B = num_running.shape[0]
-        dev = num_running.device
-        q = Q_load / 1000.0 if Q_load is not None else torch.zeros(B, 1, device=dev)
-        t = T_dry / 300.0   if T_dry  is not None else torch.zeros(B, 1, device=dev)
-        x = torch.cat([num_running / 3.0, q, t], dim=1)
-        on_mask = (num_running > 0).float()
-        return torch.sigmoid(self.net(x)) * MAX_FIXED_KW * on_mask
+    def forward(self, v_cdw_norm, num_running):
+        on_mask = (num_running > 0)
+        num_norm = num_running / 3.0
+        return self.block(v_cdw_norm, num_norm, on_mask=on_mask)
 
 
-class VFDPumpSPINN(nn.Module):
+class PRIPumpSPINN(nn.Module):
     """
-    次側變速泵 v8.4：只用 V_norm（state），完全與 action 解耦。
-
-    次側泵由 DP 控制器驅動，控制信號是 CWL_SEC_PM_SPD（不在 policy action 中）。
-    因此 VFD 功率是 state 的函數，對 policy 無梯度，需配合 detach_pump 使用。
-
-    輸入：[V_norm, num_sec_pumps/2]
-    輸出：sigmoid * MAX * on_mask
+    主側冷水泵（Primary CHW Pump × 3）S-PINN。
+    λ_pri 可學習，V_pri 來自 CWL_PRI_CW_FLOW（state[10] × v_pri_max）。
     """
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-        nn.init.constant_(self.net[-1].bias, 0.0)
+        self.block = PumpPhysicsBlock(learnable_lam=True, init_log_scale=2.5)
 
-    def forward(self, V_norm, num_sec_pumps):
-        on_mask = (num_sec_pumps > 0).float()
-        x       = torch.cat([V_norm, num_sec_pumps / 2.0], dim=1)
-        return torch.sigmoid(self.net(x)) * SEC_PUMP_MAX_KW * on_mask
+    def forward(self, v_pri_norm, num_running):
+        on_mask = (num_running > 0)
+        num_norm = num_running / 3.0
+        return self.block(v_pri_norm, num_norm, on_mask=on_mask)
+
+
+class SECPumpSPINN(nn.Module):
+    """
+    次側變速泵（Secondary CHW Pump × 2）S-PINN。
+    λ_sec 從資料計算（state[11]），不可學習，代入 lam_input。
+    num_sec = min(num_running, 2)。
+    """
+    def __init__(self):
+        super().__init__()
+        self.block = PumpPhysicsBlock(learnable_lam=False, init_log_scale=3.0)
+
+    def forward(self, v_sec_norm, num_sec_pumps, lam_sec_norm):
+        on_mask = (num_sec_pumps > 0)
+        num_norm = num_sec_pumps / 2.0
+        return self.block(v_sec_norm, num_norm,
+                          lam_input=lam_sec_norm, on_mask=on_mask)
 
 
 class PumpSPINN(nn.Module):
+    """
+    整合三種泵的 S-PINN，論文 Eq.(12) 完整實作。
+
+    forward 需要的 state 索引：
+      state[4]  = CWL_SEC_CW_FLOW（原始 GPM，由 physics_forward 歸一化）
+      state[9]  = V_cdw_norm（CDWL_CW_FLOW / v_cdw_max）
+      state[10] = V_pri_norm（CWL_PRI_CW_FLOW / v_pri_max）
+      state[11] = lam_sec_norm（CWL_SEC_DP / V² / lam_sec_scale）
+    """
     def __init__(self):
         super().__init__()
-        self.fixed_pump = FixedSpeedPumpModel()
-        self.vfd_pump   = VFDPumpSPINN()
+        self.cdw_pump = CDWPumpSPINN()
+        self.pri_pump = PRIPumpSPINN()
+        self.sec_pump = SECPumpSPINN()
 
-    def forward(self, V_norm, num_running, num_sec_pumps, Q_load=None, T_dry=None):
-        return (self.fixed_pump(num_running, Q_load, T_dry) +
-                self.vfd_pump(V_norm, num_sec_pumps))
+    def forward(self, v_sec_norm, v_cdw_norm, v_pri_norm,
+                lam_sec_norm, num_running, num_sec_pumps):
+        p_cdw = self.cdw_pump(v_cdw_norm, num_running)
+        p_pri = self.pri_pump(v_pri_norm, num_running)
+        p_sec = self.sec_pump(v_sec_norm, num_sec_pumps, lam_sec_norm)
+        return p_cdw, p_pri, p_sec
 
 
 class TowerTPINN(nn.Module):
@@ -214,7 +296,7 @@ class DecisionPINN(nn.Module):
         super().__init__()
         self.V_max = V_max
         self.policy_net = nn.Sequential(
-            nn.Linear(9, 128), nn.ReLU(),
+            nn.Linear(12, 128), nn.ReLU(),   # 輸入從 9 → 12 維
             nn.Linear(128, 128), nn.ReLU(),
             nn.Linear(128, 9), nn.Sigmoid()
         )
@@ -231,7 +313,7 @@ class DecisionPINN(nn.Module):
             for p in m.parameters(): p.requires_grad = True
 
     def forward(self, state):
-        raw      = self.policy_net(state)
+        raw      = self.policy_net(state)          # state 現在是 12 維
         chl_sta  = state[:, 6:9]
         T_wet    = state[:, 1:2]
         T_sec_rw = state[:, 3:4]
@@ -246,15 +328,14 @@ class DecisionPINN(nn.Module):
                           ct_fan_spd, chl_comp_spd], dim=1)
 
     def physics_forward(self, state, action, detach_pump=True):
-        """
-        detach_pump=True（預設）：泵功率 stop-gradient。
-        因為泵的控制變量（次側泵速）不在 policy action 中，
-        泵功率本質上是 state 的函數，對 policy 梯度無意義。
-        training 和 evaluate 都用 True，保持一致。
-        """
         T_dry    = state[:, 0:1]; T_wet    = state[:, 1:2]
         Q_load   = state[:, 2:3]; T_sec_rw = state[:, 3:4]
         V_sec    = state[:, 4:5]; chl_sta  = state[:, 6:9]
+        # v8.5 新增流量和 λ
+        v_cdw_norm  = state[:, 9:10]
+        v_pri_norm  = state[:, 10:11]
+        lam_sec_norm = state[:, 11:12]
+
         T_chw_set  = action[:, 0:1]; T_cdw_set  = action[:, 1:2]
         ct_fan_spd = action[:, 3:6]; comp_spd   = action[:, 6:9]
 
@@ -262,8 +343,12 @@ class DecisionPINN(nn.Module):
         num_running   = chl_sta.sum(dim=1, keepdim=True)
         num_sec_pumps = torch.clamp(num_running, max=2.0)
 
-        # 泵功率：只用 state（V_norm, num_running, Q_load, T_dry），與 action 無關
-        pump_power = self.pump_spinn(V_norm, num_running, num_sec_pumps, Q_load, T_dry)
+        # 三台泵各自計算（論文 Eq.12）
+        p_cdw, p_pri, p_sec = self.pump_spinn(
+            V_norm, v_cdw_norm, v_pri_norm,
+            lam_sec_norm, num_running, num_sec_pumps)
+        pump_power = p_cdw + p_pri + p_sec
+
         if detach_pump:
             pump_power = pump_power.detach()
 
@@ -292,6 +377,9 @@ class DecisionPINN(nn.Module):
             "mech_chiller_power":        mech_chiller_power,
             "chiller_sigma":             chiller_sigma,
             "pump_power":                pump_power,
+            "pump_cdw":                  p_cdw,
+            "pump_pri":                  p_pri,
+            "pump_sec":                  p_sec,
             "tower_power":               tower_power,
             "tower_sigma":               tower_sigma,
             "Q_rejection":               Q_rejection,
