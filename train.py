@@ -39,7 +39,7 @@ def health_check(model, loader, device, v_max):
         num_sec_pumps = torch.clamp(num_running, max=2.0)
         on_mask       = (num_running > 0)
 
-        p_fixed, p_sec = model.pump_spinn(V_norm, dp_norm, num_running, num_sec_pumps, Q_load, T_dry)
+        p_fixed, p_sec = model.pump_spinn(V_norm, num_running, num_sec_pumps, Q_load, T_dry)
 
         sc_sec  = model.pump_spinn.sec_pump.get_scale()
 
