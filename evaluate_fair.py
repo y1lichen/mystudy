@@ -1,4 +1,4 @@
-"""evaluate_fair.py — v8.10"""
+"""evaluate_fair.py — v8.12"""
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -20,8 +20,7 @@ def evaluate_model():
     dataset    = LBNLChillerDataset("data/ChillerPlant_test.csv")
     dataloader = DataLoader(dataset, batch_size=1024, shuffle=False)
     model = DecisionPINN(V_max=dataset.v_max).to(device)
-    model.load_state_dict(torch.load("decision_pinn.pth", map_location=device,
-                                     weights_only=True))
+    model.load_state_dict(torch.load("decision_pinn.pth", map_location=device, weights_only=True))
     model.eval()
 
     sc_sec  = model.pump_spinn.sec_pump.get_scale()
@@ -48,22 +47,12 @@ def evaluate_model():
             state       = state.to(device)
             hist_action = hist_action.to(device)
 
+            # 基準測試：使用歷史 action 與歷史台數
             hist_phys  = model.physics_forward(state, hist_action)
-            opt_action = model(state)
-            opt_phys   = model.physics_forward(state, opt_action)
-
-            Q_load        = state[:, 2:3]
-            T_dry         = state[:, 0:1]
-            V_sec         = state[:, 4:5]
-            dp_sec        = state[:, 5:6]
-            chl_sta       = state[:, 6:9]
             
-            V_norm        = V_sec / dataset.v_max
-            dp_norm       = dp_sec / 1000.0
-            num_running   = chl_sta.sum(dim=1, keepdim=True)
-            num_sec_pumps = torch.clamp(num_running, max=2.0)
-            
-            p_fixed, p_sec = model.pump_spinn(V_norm, dp_norm, num_running, num_sec_pumps, Q_load, T_dry)
+            # 【關鍵修改】取得 AI 最佳化行動與「最佳化台數決策」
+            opt_action, opt_chl_sta = model(state)
+            opt_phys   = model.physics_forward(state, opt_action, chl_sta_override=opt_chl_sta)
 
             all_hist_power.extend(hist_total_power.cpu().numpy())
             all_pred_hist_power.extend(hist_phys["total_power"].cpu().numpy())
@@ -75,12 +64,13 @@ def evaluate_model():
             all_pred_pump.extend(hist_phys["pump_power"].cpu().numpy())
             
             all_hist_pump_fixed.extend(hist_pump_fixed.cpu().numpy())
-            all_pred_pump_fixed.extend(p_fixed.cpu().numpy())
+            all_pred_pump_fixed.extend(hist_phys["pump_fixed"].cpu().numpy())
             all_hist_pump_vfd.extend(hist_pump_vfd.cpu().numpy())
-            all_pred_pump_vfd.extend(p_sec.cpu().numpy())
+            all_pred_pump_vfd.extend(hist_phys["pump_sec"].cpu().numpy())
             
             all_delta_s.extend(hist_phys["delta_S"].cpu().numpy())
             all_ua_tower.extend(hist_phys["UA_tower"].cpu().numpy())
+            
             all_opt_power.extend(opt_phys["total_power"].cpu().numpy())
             all_q_load.extend(state[:, 2:3].cpu().numpy())
             all_q_pred.extend(opt_phys["Q_pred"].cpu().numpy())

@@ -1,4 +1,4 @@
-"""train.py — v8.10"""
+"""train.py — v8.12 (BatchNorm 污染修復版)"""
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -29,12 +29,11 @@ def health_check(model, loader, device, v_max):
         hist_pump_vfd = hist_pump_vfd.to(device)
 
         T_dry  = state[:,0:1]; T_wet = state[:,1:2]; Q_load = state[:,2:3]
-        V_sec  = state[:,4:5]; dp_sec = state[:,5:6]; chl_sta = state[:,6:9]
+        V_sec  = state[:,4:5]; chl_sta = state[:,6:9]
         T_chw  = hist_action[:,0:1]; T_cdw = hist_action[:,1:2]
         ct_fan = hist_action[:,3:6]; comp  = hist_action[:,6:9]
 
         V_norm        = V_sec / v_max
-        dp_norm       = dp_sec / 1000.0
         num_running   = chl_sta.sum(dim=1, keepdim=True)
         num_sec_pumps = torch.clamp(num_running, max=2.0)
         on_mask       = (num_running > 0)
@@ -53,7 +52,7 @@ def health_check(model, loader, device, v_max):
                           chl_sta.sum(dim=1, keepdim=True)], dim=1)
         tm, _ = model.tower_tpinn(tf_t)
 
-        print(f"\n  [健康檢查 v8.10 - 終極融合版]")
+        print(f"\n  [健康檢查 v8.12 - 設備群控修復版]")
         print(f"  Sec 泵 Scale = {sc_sec:.2f} kW")
         print(f"  開機樣本: {on_mask.sum().item()}/{len(on_mask)}")
         if on_mask.any():
@@ -62,16 +61,15 @@ def health_check(model, loader, device, v_max):
             print(f"  Sec 泵(變速): 預測={p_sec[m].mean():.2f}  真實={hist_pump_vfd[m].mean():.2f} kW")
         print(f"  冷  機: 預測={pred_chiller.mean():.2f}  真實={hist_chiller.mean():.2f} kW")
         print(f"  水  塔: 預測={tm.mean():.2f}  真實={hist_tower.to(device).mean():.2f} kW")
-    model.train()
 
 def train():
-    phase1_epochs = 30
-    phase2_epochs = 30
+    phase1_epochs = 40
+    phase2_epochs = 120
     batch_size    = 256
     trend_batch   = 64
     trend_weight  = 0.05
 
-    wandb.init(project="HVAC-Decision-PINN", name="v8.10-ultimate-fusion", config={
+    wandb.init(project="HVAC-Decision-PINN", name="v8.12-Staging-Control", config={
         "phase1_epochs": phase1_epochs, "phase2_epochs": phase2_epochs,
         "pump_model": "Fixed: Combined MLP, SEC: P=DP*V/η",
     })
@@ -95,10 +93,10 @@ def train():
     sch_chiller = torch.optim.lr_scheduler.CosineAnnealingLR(opt_chiller, T_max=phase1_epochs)
 
     print("\n🚀 Phase 1: System ID")
-    model.unfreeze_physics()
+    model.unfreeze_physics() # 這裡會自動幫環境設定 m.train()
 
     for epoch in range(phase1_epochs):
-        model.train()
+        model.train() # Phase 1 整個網路都是 train 模式
         ep_fix = ep_sec = ep_tower = ep_chiller = ep_pt = ep_pc = 0.0
 
         for batch in dataloader:
@@ -114,12 +112,11 @@ def train():
             hist_pump_vfd = hist_pump_vfd.to(device)
 
             T_dry  = state[:,0:1]; T_wet = state[:,1:2]; Q_load = state[:,2:3]
-            V_sec  = state[:,4:5]; dp_sec = state[:,5:6]; chl_sta = state[:,6:9]
+            V_sec  = state[:,4:5]; chl_sta = state[:,6:9]
             T_chw  = hist_action[:,0:1]; T_cdw = hist_action[:,1:2]
             ct_fan = hist_action[:,3:6]; comp  = hist_action[:,6:9]
 
             V_norm        = V_sec / dataset.v_max
-            dp_norm       = dp_sec / 1000.0
             num_running   = chl_sta.sum(dim=1, keepdim=True)
             num_sec_pumps = torch.clamp(num_running, max=2.0)
             on_mask       = (num_running > 0)
@@ -132,7 +129,7 @@ def train():
             opt_fixed.step()
 
             opt_sec.zero_grad()
-            p_sec = model.pump_spinn.sec_pump(V_norm, dp_norm, num_sec_pumps)
+            p_sec = model.pump_spinn.sec_pump(V_norm, num_sec_pumps)
             loss_sec = masked_mse(p_sec, hist_pump_vfd, on_mask)
             loss_sec.backward()
             torch.nn.utils.clip_grad_norm_(model.pump_spinn.sec_pump.parameters(), 1.0)
@@ -181,24 +178,28 @@ def train():
         if epoch == 0:
             health_check(model, dataloader, device, dataset.v_max)
 
-    print("\n🚀 Phase 2: Policy (解除束縛，回歸 2000:5000 權重)")
-    model.freeze_physics()
+    print("\n🚀 Phase 2: Policy (設備群控與台數最佳化)")
+    model.eval()           # 【關鍵修復】先將全域設為 eval，徹底凍結 BatchNorm
+    model.freeze_physics() # 確保權重鎖定
 
     for epoch in range(phase2_epochs):
-        model.train()
+        # 【關鍵修復】只將大腦切換為 train，讓 Gumbel-Softmax 生效，但物理環境保持 eval
+        model.policy_net.train() 
+        
         ep_pol = ep_e = ep_l = ep_c = 0.0
         for batch in dataloader:
             state  = batch[0].to(device)
             Q_load = state[:, 2:3]
             opt_policy.zero_grad()
-            p = model.physics_forward(state, model(state))
+            
+            opt_action, opt_chl_sta = model(state)
+            p = model.physics_forward(state, opt_action, chl_sta_override=opt_chl_sta)
             
             L_e = torch.mean(p["total_power"] / (Q_load + 10.0))
             L_l = torch.mean(F.relu(Q_load - p["Q_pred"]) / (Q_load + 1e-6))
             T_cdw_excess = F.relu(p["T_cdw_set"] - p["T_wet"] - 15.0)
             L_c = torch.mean(T_cdw_excess)
             
-            # 恢復 v8.4 最完美的權重比例
             loss = 2000.0 * L_e + 5000.0 * L_l + 50.0 * L_c
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.policy_net.parameters(), 1.0)

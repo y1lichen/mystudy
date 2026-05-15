@@ -1,10 +1,10 @@
 """
-DecisionPINN — v8.11 (控制邏輯整合版)
+DecisionPINN — v8.12 (設備台數群控版 - 梯度修復版)
 
-1. 定壓控制 (Constant DP Control)：將變速泵壓頭強制錨定在 35 psi (968.8 inH2O)，
-   消除感測器雜訊，讓理想功率只與流量成正比。
-2. 流量平分 (Flow Splitting)：根據同速並聯物理，將總流量除以開機台數 (v_per_pump)，
-   讓 eff_net 精準學習「單台水泵」的真實效率曲線。
+1. Policy 輸出升級：大腦直接決策 [T_chw_set, T_cdw_set, N_chillers]。
+2. 梯度流動 (Gumbel-Softmax)：解決台數決策 (1,2,3) 的離散不可導問題。
+3. 關鍵修復：將 self.training 改為 self.policy_net.training，
+   確保在全域 eval 模式下，Gumbel-Softmax 依然能正確傳遞梯度。
 """
 
 import torch
@@ -51,12 +51,9 @@ class CombinedFixedPumpSPINN(nn.Module):
 
 
 class SECPumpSPINN(nn.Module):
-    """【v8.11 修正】整合 35 psi 定壓控制與同速並聯物理"""
     def __init__(self, init_log_scale=4.0): 
         super().__init__()
         self.log_scale = nn.Parameter(torch.tensor(float(init_log_scale)))
-        
-        # 網路輸入改為 2 維：[v_per_pump, num_norm]
         self.eff_net = nn.Sequential(
             nn.Linear(2, 32), nn.BatchNorm1d(32), nn.ReLU(),
             nn.Linear(32, 32), nn.BatchNorm1d(32), nn.ReLU(),
@@ -68,14 +65,10 @@ class SECPumpSPINN(nn.Module):
     def forward(self, v_sec_norm, num_sec_pumps):
         on_mask  = (num_sec_pumps > 0).float()
         num_norm = num_sec_pumps / 2.0
-
-        # 【修正 1】35 psi = 968.8 inH2O，歸一化基準為 1000.0
         dp_norm_fixed = 0.9688
         
         P_scale = torch.exp(self.log_scale)
         ideal   = dp_norm_fixed * v_sec_norm
-
-        # 【修正 2】同速並聯，流量平分 (clamp 避免除以零)
         v_per_pump = v_sec_norm / torch.clamp(num_sec_pumps, min=1.0)
         
         eff_input = torch.cat([v_per_pump, num_norm], dim=1)
@@ -94,7 +87,6 @@ class PumpSPINN(nn.Module):
         self.fixed_pump = CombinedFixedPumpSPINN()
         self.sec_pump   = SECPumpSPINN()
 
-    # 移除了不需要的 dp_norm 介面
     def forward(self, v_sec_norm, num_running, num_sec_pumps, Q_load, T_dry):
         p_fixed = self.fixed_pump(num_running, Q_load, T_dry)
         p_sec   = self.sec_pump(v_sec_norm, num_sec_pumps)
@@ -131,6 +123,57 @@ class ChillerTSPINN(nn.Module):
         return F.relu(power_mu), sigma, delta_S
 
 
+def _trend_loss(net_fn, feat_ranges, fixed_ranges, n_steps, device, batch_size):
+    D     = len(fixed_ranges)
+    total = torch.tensor(0.0, device=device)
+    for name, (lo, hi, trend, idx) in feat_ranges.items():
+        if trend is None:
+            continue
+        cols  = [torch.empty(batch_size, 1, device=device).uniform_(*fixed_ranges[i])
+                 for i in range(D) if i != idx]
+        fixed = torch.cat(cols, dim=1)
+        seq, violations, prev_mu = torch.linspace(lo, hi, n_steps, device=device), [], None
+        for val in seq:
+            feat = torch.zeros(batch_size, D, device=device)
+            j = 0
+            for i in range(D):
+                if i == idx: feat[:, i] = val
+                else:        feat[:, i] = fixed[:, j]; j += 1
+            out = net_fn(feat)
+            mu  = out[0] if isinstance(out, tuple) else out
+            if prev_mu is not None:
+                diff = mu - prev_mu
+                violations.append(F.relu(-diff) if trend == 'increase' else F.relu(diff))
+            prev_mu = mu.detach()
+        if violations:
+            total = total + torch.stack(violations).mean()
+    return total
+
+
+def trend_physics_loss_tower(tower_net, batch_size, device):
+    feat_ranges = {
+        'Q_rej':      (0.,   2000., 'increase', 0),
+        'T_dry':      (250., 300.,  'increase', 1),
+        'T_wet':      (250., 308.,  'increase', 2),
+        'T_approach': (0.1,  35.,   'decrease', 3),
+        'n_towers':   (1.,   3.,    None,        4),
+    }
+    fixed_ranges = [(0., 2000.), (250., 300.), (250., 308.), (0.1, 35.), (1., 3.)]
+    return _trend_loss(tower_net, feat_ranges, fixed_ranges, 10, device, batch_size)
+
+
+def trend_physics_loss_chiller(chiller_net, batch_size, device):
+    feat_ranges = {
+        'Q_load': (10.,  2000., 'increase', 0),
+        'T_chw':  (278., 286.,  'decrease', 1),
+        'T_cdw':  (288., 303.,  'increase', 2),
+        'V_chw':  (0.1,  1.0,   None,        3),
+        'V_cdw':  (0.05, 1.0,   'decrease',  4),
+    }
+    fixed_ranges = [(10., 2000.), (278., 286.), (288., 303.), (0.1, 1.0), (0.05, 1.0)]
+    return _trend_loss(chiller_net, feat_ranges, fixed_ranges, 10, device, batch_size)
+
+
 class DecisionPINN(nn.Module):
     def __init__(self, V_max=2500.0):
         super().__init__()
@@ -138,7 +181,7 @@ class DecisionPINN(nn.Module):
         self.policy_net = nn.Sequential(
             nn.Linear(9, 128), nn.ReLU(),
             nn.Linear(128, 128), nn.ReLU(),
-            nn.Linear(128, 9), nn.Sigmoid()
+            nn.Linear(128, 7)
         )
         self.pump_spinn     = PumpSPINN()
         self.tower_tpinn    = TowerTPINN()
@@ -154,26 +197,55 @@ class DecisionPINN(nn.Module):
 
     def forward(self, state):
         raw      = self.policy_net(state[:, :9])
-        chl_sta  = state[:, 6:9]
         T_wet    = state[:, 1:2]
         T_sec_rw = state[:, 3:4]
         
-        T_chw_set = 276.5 + raw[:, 0:1] * (284.3 - 276.5)
+        # 1. 溫度設定點決策
+        t_chw_sig = torch.sigmoid(raw[:, 0:1])
+        t_cdw_sig = torch.sigmoid(raw[:, 1:2])
+        
+        T_chw_set = 276.5 + t_chw_sig * (284.3 - 276.5)
         T_chw_set = torch.min(T_chw_set, T_sec_rw - 2.0)
         T_chw_set = torch.clamp(T_chw_set, min=274.15, max=284.3)
-        T_cdw_set = 288.7 + raw[:, 1:2] * (302.6 - 288.7)
+        T_cdw_set = 288.7 + t_cdw_sig * (302.6 - 288.7)
         T_cdw_set = torch.max(T_cdw_set, T_wet + 2.0)
         
-        ct_fan_spd   = raw[:, 3:6] * chl_sta
-        chl_comp_spd = raw[:, 6:9] * chl_sta
+        # 2. 開機台數決策 (N_chillers) 
+        logits_n = raw[:, 2:5]
         
-        return torch.cat([T_chw_set, T_cdw_set, raw[:, 2:3],
-                          ct_fan_spd, chl_comp_spd], dim=1)
+        # 【關鍵修復】判定 policy_net 狀態，確保全域 eval 下依然能流動梯度
+        if self.policy_net.training:
+            n_onehot = F.gumbel_softmax(logits_n, tau=1.0, hard=True)
+        else:
+            idx = torch.argmax(logits_n, dim=-1)
+            n_onehot = F.one_hot(idx, num_classes=3).float()
+            
+        c1 = torch.ones_like(n_onehot[:, 0]) # 系統最少開 1 台
+        c2 = n_onehot[:, 1] + n_onehot[:, 2] # 決策為 2 或 3 時開第 2 台
+        c3 = n_onehot[:, 2]                  # 決策為 3 時開第 3 台
+        chl_sta_pred = torch.stack([c1, c2, c3], dim=1)
+        
+        # 3. 風扇與壓縮機轉速決策 (只套用在有開機的設備上)
+        global_fan  = torch.sigmoid(raw[:, 5:6])
+        global_comp = torch.sigmoid(raw[:, 6:7])
+        
+        ct_fan_spd   = global_fan * chl_sta_pred
+        chl_comp_spd = global_comp * chl_sta_pred
+        
+        action_tensor = torch.cat([T_chw_set, T_cdw_set, raw[:, 2:3],
+                                   ct_fan_spd, chl_comp_spd], dim=1)
+                                   
+        return action_tensor, chl_sta_pred
 
-    def physics_forward(self, state, action, detach_pump=True):
+    def physics_forward(self, state, action, chl_sta_override=None, detach_pump=True):
         T_dry    = state[:, 0:1]; T_wet    = state[:, 1:2]
         Q_load   = state[:, 2:3]; T_sec_rw = state[:, 3:4]
-        V_sec    = state[:, 4:5]; chl_sta  = state[:, 6:9]
+        V_sec    = state[:, 4:5]
+        
+        if chl_sta_override is not None:
+            chl_sta = chl_sta_override
+        else:
+            chl_sta = state[:, 6:9]
 
         T_chw_set  = action[:, 0:1]; T_cdw_set  = action[:, 1:2]
         ct_fan_spd = action[:, 3:6]; comp_spd   = action[:, 6:9]
@@ -182,7 +254,6 @@ class DecisionPINN(nn.Module):
         num_running   = chl_sta.sum(dim=1, keepdim=True)
         num_sec_pumps = torch.clamp(num_running, max=2.0)
 
-        # 這裡不再需要傳入 dp_norm
         p_fixed, p_sec = self.pump_spinn(V_norm, num_running, num_sec_pumps, Q_load, T_dry)
         pump_power = p_fixed + p_sec
 
